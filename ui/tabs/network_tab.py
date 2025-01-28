@@ -4,8 +4,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
 from PySide6.QtCore import Qt
 import networkx as nx
 import re
-
-# ui/tabs/network_tab.py
+from .path_extractor import PathExtractor
 
 class NetworkTab(QWidget):
     def __init__(self):
@@ -18,7 +17,8 @@ class NetworkTab(QWidget):
             'SW': 'Smart Water',
             'F': 'Field'
         }
-        self.G = nx.DiGraph()
+        self.connections = [] #Store connections as strings instead of using networkx
+        self.node_labels = {}
         self.setup_ui()
 
     def setup_ui(self):
@@ -105,7 +105,8 @@ class NetworkTab(QWidget):
                     self.file_label.setText(file_name.split('/')[-1])
                     self.content_preview.setText(content)
                     self.analyze_components_btn.setEnabled(True)
-                    self.G.clear()
+                    self.connections = []
+                    self.node_labels.clear()
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Error reading file: {str(e)}")
 
@@ -115,18 +116,17 @@ class NetworkTab(QWidget):
         
         # Clear previous results
         self.results_tree.clear()
-        self.G.clear()
+        self.connections.clear()
+        self.node_labels.clear()
         
         # Extract all components with their labels using regex
-        # Pattern matches: ID["Label"] format
         extracted_components = re.findall(r'(\w+)\["([^\]]+)"\]', self.network_data)
         
         # Organize components by type
         component_groups = {}
-        node_labels = {}
         
         for component_id, component_label in extracted_components:
-            # Extract component type from ID (e.g., 'DP' from 'DP1')
+            # Extract component type from ID
             component_type = re.match(r'[A-Za-z]+', component_id).group()
             
             # Store in groups if it's a known component type
@@ -134,45 +134,43 @@ class NetworkTab(QWidget):
                 if component_type not in component_groups:
                     component_groups[component_type] = set()
                 component_groups[component_type].add(component_id)
-                node_labels[component_id] = component_label
-                self.G.add_node(component_id)
+                self.node_labels[component_id] = component_label
         
         # Extract connections
-        # Pattern matches: NodeA ---> NodeB or NodeA --> NodeB
-        connections = re.findall(r'(\w+)\s*-+>\s*(\w+)', self.network_data)
-        
-        # Add edges to the graph
-        for source, target in connections:
-            if source in self.G.nodes() and target in self.G.nodes():
-                self.G.add_edge(source, target)
+        self.connections = re.findall(r'(\w+)\s*-+>\s*(\w+)', self.network_data)
+        # Convert connections to the format expected by PathExtractor
+        self.connections = [f"{source}--->{target}" for source, target in self.connections]
         
         # Create tree items
         for comp_type, comp_set in sorted(component_groups.items()):
-            # Create parent item with component type and count
             parent = QTreeWidgetItem(self.results_tree)
             parent.setText(0, self.components[comp_type])
             parent.setText(1, f"Total: {len(comp_set)}")
             parent.setExpanded(True)
             
-            # Add child items for each component
             for comp_id in sorted(comp_set):
                 child = QTreeWidgetItem(parent)
-                child.setText(0, self.components[comp_type])  # Component type name
-                child.setText(1, comp_id)  # Component ID
+                child.setText(0, self.components[comp_type])
+                child.setText(1, comp_id)
                 
                 # Add label and connectivity information
-                details = node_labels.get(comp_id, "")
+                details = self.node_labels.get(comp_id, "")
                 if comp_type == 'F':
-                    predecessors = list(self.G.predecessors(comp_id))
+                    # Find predecessors by checking connections
+                    predecessors = [src for src, tgt in [conn.split("--->") for conn in self.connections] 
+                                  if tgt == comp_id]
                     if predecessors:
                         details += f" (Connected to: {', '.join(predecessors)})"
                 
-                child.setText(2, details)  # Label and additional details
+                child.setText(2, details)
         
         # Enable path analysis
         self.analyze_paths_btn.setEnabled(True)
         
         # Show component counts
+        field_count = len(component_groups.get('F', []))
+        total_count = sum(len(comp_set) for comp_set in component_groups.values())
+        
         component_counts = "\n".join(
             f"{self.components[ctype]}: {len(cset)}"
             for ctype, cset in sorted(component_groups.items())
@@ -188,34 +186,74 @@ class NetworkTab(QWidget):
         
         self.paths_display.clear()
         
-        # Get all field nodes
-        fields = [n for n in self.G.nodes() if n.startswith('F')]
-        if not fields:
-            self.paths_display.setText("No fields found in the network.")
-            return
-            
-        # Find paths to each field
-        path_text = "Paths to Fields:\n\n"
-        for field in sorted(fields):
-            path_text += f"=== Field {field} ===\n"
-            # Find all paths from distribution points to this field
-            sources = [n for n in self.G.nodes() if n.startswith('DP')]
-            
-            field_paths = []
-            for source in sources:
-                try:
-                    paths = list(nx.all_simple_paths(self.G, source, field))
-                    field_paths.extend(paths)
-                except nx.NetworkXNoPath:
-                    continue
-            
-            if field_paths:
-                for i, path in enumerate(field_paths, 1):
-                    path_text += f"Path {i}: {' -> '.join(path)}\n"
-            else:
-                path_text += "No paths found to this field\n"
-            path_text += "\n"
-            
+        # Get raw connection lines from the mermaid file
+        connection_lines = [line.strip() for line in self.network_data.split('\n') 
+                        if '-->' in line]
+        
+        # Create path extractor with raw connection lines
+        path_extractor = PathExtractor(connection_lines)
+        
+        # Build connection maps to determine start and end points
+        outgoing_map = {}
+        incoming_map = {}
+        all_nodes = set()
+        
+        for conn in connection_lines:
+            for source, target in path_extractor.extract_connections(conn):
+                all_nodes.add(source)
+                all_nodes.add(target)
+                
+                if source not in outgoing_map:
+                    outgoing_map[source] = set()
+                outgoing_map[source].add(target)
+                
+                if target not in incoming_map:
+                    incoming_map[target] = set()
+                incoming_map[target].add(source)
+        
+        # Find start points (nodes with no incoming connections)
+        start_points = [node for node in all_nodes if node not in incoming_map]
+        
+        # Find end points (nodes with no outgoing connections)
+        end_points = [node for node in all_nodes if node not in outgoing_map]
+        
+        # Sort points for consistent display
+        start_points.sort()
+        end_points.sort()
+        
+        # Find all paths
+        path_extractor.find_all_paths(start_points, end_points)
+        
+        # Get path analysis results
+        path_text = path_extractor.get_path_summary()
+        
+        # Display results
         self.paths_display.setText(path_text)
         
-        QMessageBox.information(self, "Success", f"Path analysis completed for {len(fields)} fields!")
+        # Calculate summary statistics
+        total_paths = sum(len(paths) for paths in path_extractor.paths.values())
+        total_endpoints = len(end_points)
+        endpoints_with_paths = sum(1 for paths in path_extractor.paths.values() if paths)
+        
+        if total_paths == 0:
+            QMessageBox.warning(self, "Analysis Complete", 
+                f"No valid paths found from detected source points ({', '.join(start_points)}) "
+                f"to end points ({', '.join(end_points)}).\n"
+                "Please check the diagnostic information for details.")
+            return
+            
+        # Calculate average path length
+        path_lengths = []
+        for paths in path_extractor.paths.values():
+            for path in paths:
+                path_lengths.append(len(path) - 1)  # -1 because n nodes = n-1 segments
+                
+        avg_path_length = sum(path_lengths) / len(path_lengths) if path_lengths else 0
+        
+        # Show summary message
+        QMessageBox.information(self, "Analysis Complete", 
+            f"Found paths to {endpoints_with_paths} out of {total_endpoints} end points.\n"
+            f"Start points detected: {', '.join(start_points)}\n"
+            f"End points detected: {', '.join(end_points)}\n"
+            f"Total number of unique paths: {total_paths}\n"
+            f"Average path length: {avg_path_length:.1f} segments")
