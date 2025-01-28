@@ -109,6 +109,25 @@ class NetworkTab(QWidget):
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Error reading file: {str(e)}")
 
+    def parse_node_info(self, node_text):
+        """Parse node text to extract ID and label."""
+        # Match pattern: ID["Label"] or just ID
+        # Handle both quoted and unquoted labels
+        match = re.match(r'([A-Za-z][A-Za-z0-9_]*(?:[-.][A-Za-z0-9_]+)*)\s*(?:\["([^"]+)"\]|\[([^]]+)\])?', node_text.strip())
+        if match:
+            node_id = match.group(1)  # The ID part
+            # Take either the quoted or unquoted label
+            node_label = match.group(2) if match.group(2) else (match.group(3) if match.group(3) else "")
+            return node_id, node_label
+        return node_text.strip(), ""
+
+    def split_arrow_connection(self, line):
+        """Split a line by arrow connection, handling different arrow formats."""
+        # Match different arrow patterns with optional spaces
+        arrow_pattern = r'\s*-+>\s*'
+        parts = re.split(arrow_pattern, line.strip())
+        return [p.strip() for p in parts if p.strip()]
+
     def analyze_components(self):
         if not self.network_data:
             return
@@ -117,48 +136,74 @@ class NetworkTab(QWidget):
         self.results_tree.clear()
         self.G.clear()
         
-        # Extract all components with their labels using regex
-        # Pattern matches: ID["Label"] format
-        extracted_components = re.findall(r'(\w+)\["([^\]]+)"\]', self.network_data)
-        
-        # Organize components by type
-        component_groups = {}
+        components = {}
         node_labels = {}
+        edges = []
         
-        for component_id, component_label in extracted_components:
-            # Extract component type from ID (e.g., 'DP' from 'DP1')
-            component_type = re.match(r'[A-Za-z]+', component_id).group()
+        lines = self.network_data.split('\n')
+        
+        # First pass - collect all nodes and their labels
+        for line in lines:
+            line = line.strip()
             
-            # Store in groups if it's a known component type
-            if component_type in self.components:
-                if component_type not in component_groups:
-                    component_groups[component_type] = set()
-                component_groups[component_type].add(component_id)
-                node_labels[component_id] = component_label
-                self.G.add_node(component_id)
-        
-        # Extract connections
-        # Pattern matches: NodeA ---> NodeB or NodeA --> NodeB
-        connections = re.findall(r'(\w+)\s*-+>\s*(\w+)', self.network_data)
+            # Skip empty lines and comments
+            if not line or line.startswith('%'):
+                continue
+                
+            # Process connection lines (e.g., DP1--->F1 or DP1 ---> F1)
+            if '-->' in line or '--->' in line:
+                parts = self.split_arrow_connection(line)
+                if len(parts) == 2:
+                    source_text = parts[0]
+                    target_text = parts[1]
+                    
+                    # Process source
+                    source_id, source_label = self.parse_node_info(source_text)
+                    if source_label:
+                        node_labels[source_id] = source_label
+                        
+                    # Process targets (handle multiple targets separated by &)
+                    targets = target_text.split('&')
+                    for target in targets:
+                        target_id, target_label = self.parse_node_info(target.strip())
+                        if target_label:
+                            node_labels[target_id] = target_label
+                        edges.append((source_id, target_id))
+                        
+                        # Add both source and target
+                        for node_id in [source_id, target_id]:
+                            self.add_component(node_id, components)
+            
+            # Process node definitions with labels (e.g., F1_1["Field 1"])
+            elif '"' in line or '[' in line:
+                node_id, node_label = self.parse_node_info(line)
+                if node_id:
+                    if node_label:
+                        node_labels[node_id] = node_label
+                    self.add_component(node_id, components)
+            
+            # Process style definitions (e.g., F1_1:::field)
+            elif ':::field' in line:
+                parts = line.split(':::')
+                if len(parts) > 1:
+                    node_id = parts[0].strip()
+                    self.add_component(node_id, components)
         
         # Add edges to the graph
-        for source, target in connections:
-            if source in self.G.nodes() and target in self.G.nodes():
-                self.G.add_edge(source, target)
+        for source, target in edges:
+            self.G.add_edge(source, target)
         
         # Create tree items
-        for comp_type, comp_set in sorted(component_groups.items()):
-            # Create parent item with component type and count
+        for comp_type, comp_set in components.items():
             parent = QTreeWidgetItem(self.results_tree)
             parent.setText(0, self.components[comp_type])
             parent.setText(1, f"Total: {len(comp_set)}")
             parent.setExpanded(True)
             
-            # Add child items for each component
             for comp_id in sorted(comp_set):
                 child = QTreeWidgetItem(parent)
-                child.setText(0, self.components[comp_type])  # Component type name
-                child.setText(1, comp_id)  # Component ID
+                child.setText(0, self.components[comp_type])
+                child.setText(1, comp_id)
                 
                 # Add label and connectivity information
                 details = node_labels.get(comp_id, "")
@@ -167,20 +212,25 @@ class NetworkTab(QWidget):
                     if predecessors:
                         details += f" (Connected to: {', '.join(predecessors)})"
                 
-                child.setText(2, details)  # Label and additional details
+                child.setText(2, details)
         
-        # Enable path analysis
         self.analyze_paths_btn.setEnabled(True)
         
-        # Show component counts
-        component_counts = "\n".join(
-            f"{self.components[ctype]}: {len(cset)}"
-            for ctype, cset in sorted(component_groups.items())
-        )
-        
+        field_count = len(components.get('F', []))
+        total_count = sum(len(comp_set) for comp_set in components.values())
         QMessageBox.information(self, "Success", 
-            f"Component analysis completed!\n\n"
-            f"Component counts:\n{component_counts}")
+            f"Component analysis completed!\n"
+            f"Total components: {total_count}\n"
+            f"Fields found: {field_count}")
+
+    def add_component(self, node_id, components):
+        """Helper method to add a component to the components dictionary."""
+        comp_type = node_id[:2] if len(node_id) >= 2 else node_id[:1]
+        if comp_type in self.components:
+            if comp_type not in components:
+                components[comp_type] = set()
+            components[comp_type].add(node_id)
+            self.G.add_node(node_id)
 
     def analyze_paths(self):
         if not self.network_data:
